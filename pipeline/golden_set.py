@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import date
+from typing import Optional
 from pipeline.gemini import call_gemini
 
 
@@ -16,7 +17,7 @@ def export_golden_set(golden_set: dict) -> str:
     return json.dumps(golden_set, indent=2, default=str)
 
 
-def record_run(golden_set: dict, agreement_pct: float | None, examples_added: int) -> dict:
+def record_run(golden_set: dict, agreement_pct: Optional[float], examples_added: int) -> dict:
     golden_set["runs"].append({
         "date": str(date.today()),
         "agreement_rate": round(agreement_pct, 1) if agreement_pct else None,
