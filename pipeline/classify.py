@@ -5,7 +5,7 @@ from pipeline.gemini import call_gemini
 
 
 def build_rubric_context(rubric_df: pd.DataFrame) -> tuple[str, dict]:
-    context = "CLASSIFICATION RUBRIC:\n\n"
+    context = "ANALYSIS RUBRIC:\n\n"
     allowed = {}
 
     for _, row in rubric_df.iterrows():
@@ -25,34 +25,48 @@ def build_rubric_context(rubric_df: pd.DataFrame) -> tuple[str, dict]:
 
 
 def _constraint_block(allowed: dict) -> str:
-    field_map = {
-        "Failure Mode": "failure_mode",
-        "Escalation Trigger": "escalation_trigger",
-    }
     block = "\n────────────────────────────────────────\n"
     block += "STRICT OUTPUT CONSTRAINTS:\n"
     block += "Use ONLY these exact values. Output \"unclear\" if nothing fits.\n\n"
     for dim, vals in allowed.items():
-        field = field_map.get(dim, dim.lower().replace(" ", "_"))
+        field = dim.lower().replace(" ", "_")
         block += f"  • {field}: {', '.join(vals)}\n"
     block += "  • confidence: high, medium, low\n"
     block += "────────────────────────────────────────\n\n"
     return block
 
 
-def classify_row(rubric_context: str, transcript: str, user_summary: str) -> dict:
+def _build_output_fields(allowed: dict) -> str:
+    """Build the JSON field list dynamically from rubric dimensions."""
+    lines = []
+    for dim in allowed:
+        field = dim.lower().replace(" ", "_")
+        lines.append(f'- {field}: exact value from STRICT OUTPUT CONSTRAINTS only')
+    lines.append('- confidence: exactly "high", "medium", or "low"')
+    lines.append('- ai_notes: one sentence summarizing the key finding')
+    return "\n".join(lines)
+
+
+def classify_row(
+    rubric_context: str,
+    text: str,
+    summary: str,
+    prompt_context: str = "You are analyzing a text record.",
+) -> dict:
+    output_fields = _build_output_fields(
+        {k: [] for k in _parse_dimensions(rubric_context)}
+    )
+
     prompt = f"""{rubric_context}
 
-Classify this customer support conversation. Return ONLY a JSON object with:
-- intent: 4-9 word phrase describing what the customer was trying to do
-- failure_mode: exact value from STRICT OUTPUT CONSTRAINTS only
-- escalation_trigger: exact value from STRICT OUTPUT CONSTRAINTS only
-- confidence: exactly "high", "medium", or "low"
-- ai_notes: one sentence explaining why it escalated
+{prompt_context} Analyze the record below using the rubric above.
 
-CONVERSATION:
-User Request: {user_summary}
-Transcript: {transcript[:3000]}
+Return ONLY a JSON object with these fields:
+{output_fields}
+
+RECORD:
+Summary / Context: {summary}
+Full Text: {text[:3000]}
 
 Return ONLY valid JSON, no other text."""
 
@@ -61,16 +75,24 @@ Return ONLY valid JSON, no other text."""
     return json.loads(cleaned)
 
 
+def _parse_dimensions(rubric_context: str) -> list[str]:
+    """Extract dimension names from the rubric context string."""
+    dims = []
+    for line in rubric_context.splitlines():
+        if line and not line.startswith(" ") and ":" in line and "────" not in line:
+            name = line.split(":")[0].strip()
+            if name and name not in ("ANALYSIS RUBRIC", "STRICT OUTPUT CONSTRAINTS"):
+                dims.append(name)
+    return dims
+
+
 def check_values(result: dict, allowed: dict) -> str:
     issues = []
-    fm_allowed = [v.lower() for v in allowed.get("Failure Mode", [])]
-    et_allowed = [v.lower() for v in allowed.get("Escalation Trigger", [])]
-
-    if fm_allowed and result.get("failure_mode", "").lower() not in fm_allowed:
-        issues.append(f"failure_mode=\"{result.get('failure_mode')}\"")
-    if et_allowed and result.get("escalation_trigger", "").lower() not in et_allowed:
-        issues.append(f"escalation_trigger=\"{result.get('escalation_trigger')}\"")
+    for dim, vals in allowed.items():
+        field = dim.lower().replace(" ", "_")
+        val = result.get(field, "").lower()
+        if vals and val and val not in vals:
+            issues.append(f'{field}="{result.get(field)}"')
     if result.get("confidence", "").lower() not in ["high", "medium", "low"]:
-        issues.append(f"confidence=\"{result.get('confidence')}\"")
-
+        issues.append(f'confidence="{result.get("confidence")}"')
     return "OK" if not issues else "INVALID: " + ", ".join(issues)

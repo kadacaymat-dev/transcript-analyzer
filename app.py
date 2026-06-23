@@ -2,12 +2,12 @@ import time
 import pandas as pd
 import streamlit as st
 
-from config.settings import CLASSIFICATION_COLUMNS, AGREEMENT_THRESHOLD
+from config.settings import AGREEMENT_THRESHOLD, ANALYSIS_MODES
 from pipeline.classify import build_rubric_context, classify_row, check_values
 from pipeline.sampling import required_sample_size, sample_rows
 
-st.set_page_config(page_title="Transcript Analyzer", layout="wide")
-st.title("📊 Transcript Analyzer")
+st.set_page_config(page_title="Text Analyzer", layout="wide")
+st.title("📊 Text Analyzer")
 
 # ── Session state defaults ──────────────────────────────────────
 for key, default in {
@@ -17,9 +17,30 @@ for key, default in {
     "qa_reviews": {},
     "t_col_map": None,
     "r_col_map": None,
+    "analysis_mode": "Transcript Analysis",
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+# ── Analysis mode selector ──────────────────────────────────────
+st.sidebar.markdown("### Analysis Type")
+mode_key = st.sidebar.selectbox(
+    "What are you analyzing?",
+    list(ANALYSIS_MODES.keys()),
+    index=list(ANALYSIS_MODES.keys()).index(st.session_state.analysis_mode),
+    label_visibility="collapsed",
+)
+if mode_key != st.session_state.analysis_mode:
+    # Reset data when mode changes
+    st.session_state.analysis_mode = mode_key
+    st.session_state.transcripts = None
+    st.session_state.rubric = None
+    st.session_state.qa_sample = None
+    st.session_state.qa_reviews = {}
+    st.rerun()
+
+mode = ANALYSIS_MODES[mode_key]
+st.sidebar.caption(mode["description"])
 
 
 def _autodetect(columns: list[str], candidates: list[str]) -> str:
@@ -78,15 +99,7 @@ if step == "1 · Upload Data":
         st.success(f"Detected {len(raw_df)} rows and {len(raw_df.columns)} columns.")
 
         st.markdown("**Map your columns** — select which column in your file corresponds to each field:")
-        t_map = map_columns(
-            raw_df,
-            {
-                "Date":                 ["date", "created", "timestamp", "time"],
-                "Transcript":           ["transcript", "conversation", "chat", "text", "body"],
-                "User Request Summary": ["summary", "request", "user request", "description", "issue"],
-            },
-            key_prefix="t",
-        )
+        t_map = map_columns(raw_df, mode["text_fields"], key_prefix="t")
 
         if st.button("✅ Confirm Transcript Mapping", type="primary"):
             df = raw_df.rename(columns={v: k for k, v in t_map.items()})
@@ -139,35 +152,56 @@ if step == "1 · Upload Data":
 # STEP 2 — Classify
 # ═══════════════════════════════════════════════════════════════
 elif step == "2 · Classify":
-    st.header("Step 2 · Classify Transcripts")
+    st.header("Step 2 · Analyze")
 
     if st.session_state.transcripts is None or st.session_state.rubric is None:
-        st.warning("Upload transcripts and rubric in Step 1 first.")
+        st.warning("Upload data and rubric in Step 1 first.")
         st.stop()
 
     df = st.session_state.transcripts
-    unclassified = df[df["Intent"].isna() | (df["Intent"] == "")]
-    st.info(f"{len(unclassified)} unclassified rows · {len(df) - len(unclassified)} already done")
+    rubric_context, allowed = build_rubric_context(st.session_state.rubric)
 
-    if st.button("▶ Run Classification", type="primary"):
-        rubric_context, allowed = build_rubric_context(st.session_state.rubric)
+    # First rubric dimension drives the "classified" check
+    first_dim = list(allowed.keys())[0] if allowed else None
+    first_field = first_dim.lower().replace(" ", "_") if first_dim else "theme"
+    classified_col = first_field.replace("_", " ").title()
+
+    if classified_col not in df.columns:
+        df[classified_col] = ""
+    if "Confidence" not in df.columns:
+        df["Confidence"] = ""
+    if "AI Notes" not in df.columns:
+        df["AI Notes"] = ""
+    if "Value Check" not in df.columns:
+        df["Value Check"] = ""
+
+    unclassified = df[df[classified_col].isna() | (df[classified_col] == "")]
+    st.info(f"{len(unclassified)} unanalyzed rows · {len(df) - len(unclassified)} already done")
+
+    if st.button("▶ Run Analysis", type="primary"):
         progress = st.progress(0)
         status = st.empty()
         errors = 0
+        prompt_context = mode["prompt_context"]
 
         indices = unclassified.index.tolist()
         for i, idx in enumerate(indices):
             row = df.loc[idx]
-            status.text(f"Classifying row {i + 1} of {len(indices)}…")
+            status.text(f"Analyzing row {i + 1} of {len(indices)}…")
             try:
                 result = classify_row(
                     rubric_context,
-                    str(row.get("Transcript", "")),
-                    str(row.get("User Request Summary", "")),
+                    str(row.get("Text", "")),
+                    str(row.get("Summary", "")),
+                    prompt_context=prompt_context,
                 )
-                df.at[idx, "Intent"] = result.get("intent", "")
-                df.at[idx, "Failure Mode"] = result.get("failure_mode", "")
-                df.at[idx, "Escalation Trigger"] = result.get("escalation_trigger", "")
+                # Write all rubric dimension results back dynamically
+                for dim in allowed:
+                    field = dim.lower().replace(" ", "_")
+                    col = field.replace("_", " ").title()
+                    if col not in df.columns:
+                        df[col] = ""
+                    df.at[idx, col] = result.get(field, "")
                 df.at[idx, "Confidence"] = result.get("confidence", "")
                 df.at[idx, "AI Notes"] = result.get("ai_notes", "")
                 df.at[idx, "Value Check"] = check_values(result, allowed)
