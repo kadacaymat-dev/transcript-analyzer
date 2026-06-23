@@ -1,7 +1,17 @@
+import hashlib
 import json
 import re
 import pandas as pd
 from pipeline.gemini import call_gemini
+
+
+def rubric_hash(rubric_df: pd.DataFrame) -> str:
+    """Short hash of the rubric content — used to detect when rows are stale."""
+    key = "|".join(
+        f"{row.get('Dimension Name', '')}:{row.get('Possible Values (comma-separated)', '')}"
+        for _, row in rubric_df.iterrows()
+    )
+    return hashlib.md5(key.encode()).hexdigest()[:8]
 
 
 def build_rubric_context(rubric_df: pd.DataFrame) -> tuple[str, dict]:

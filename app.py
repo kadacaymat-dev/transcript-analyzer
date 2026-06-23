@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 
 from config.settings import AGREEMENT_THRESHOLD, ANALYSIS_MODES
-from pipeline.classify import build_rubric_context, classify_row, check_values
+from pipeline.classify import build_rubric_context, classify_row, check_values, rubric_hash
 from pipeline.golden_set import (
     new_golden_set, load_golden_set, export_golden_set,
     record_run, add_examples, classify_with_examples,
@@ -170,6 +170,7 @@ for key, default in {
     "golden_set": None,
     "transcripts": None,
     "rubric": None,
+    "rubric_version": None,
     "qa_sample": None,
     "qa_reviews": {},
     "t_col_map": None,
@@ -343,6 +344,7 @@ elif step == "1 · Upload Data":
             rdf = raw_rdf.rename(columns={v: k for k, v in r_map.items()})
             st.session_state.rubric = rdf
             st.session_state.r_col_map = r_map
+            st.session_state.rubric_version = rubric_hash(rdf)
             st.rerun()
 
     if st.session_state.rubric is not None:
@@ -373,14 +375,31 @@ elif step == "2 · Analyze":
             df[col] = ""
 
     classified_col = get_classified_col(df, allowed)
+    current_version = st.session_state.rubric_version or rubric_hash(st.session_state.rubric)
+
     unclassified = df[df[classified_col].isna() | (df[classified_col] == "")] if classified_col else df
+
+    # Detect stale rows — classified with a different rubric version
+    stale = pd.DataFrame()
+    if classified_col and "Rubric Version" in df.columns:
+        stale = df[
+            df[classified_col].notna() & (df[classified_col] != "") &
+            (df["Rubric Version"] != current_version)
+        ]
 
     gs = st.session_state.golden_set
     examples = gs.get("examples", []) if gs else []
 
-    c1, c2 = st.columns(2)
-    c1.markdown(f'<div class="stat-label">Rows to analyze</div><div class="stat-value">{len(unclassified)}</div>', unsafe_allow_html=True)
-    c2.markdown(f'<div class="stat-label">Already done</div><div class="stat-value">{len(df) - len(unclassified)}</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(f'<div class="stat-label">Unanalyzed</div><div class="stat-value">{len(unclassified)}</div>', unsafe_allow_html=True)
+    c2.markdown(f'<div class="stat-label">Analyzed</div><div class="stat-value">{len(df) - len(unclassified)}</div>', unsafe_allow_html=True)
+    c3.markdown(f'<div class="stat-label">Rubric version</div><div class="stat-value" style="font-size:1rem;font-family:monospace">{current_version}</div>', unsafe_allow_html=True)
+
+    if len(stale) > 0:
+        st.warning(
+            f"{len(stale)} rows were classified with an older rubric version. "
+            f"Run analysis to update them, or skip to keep existing results."
+        )
 
     if st.session_state.study_type == "Recurring":
         st.markdown("")
@@ -390,6 +409,14 @@ elif step == "2 · Analyze":
             st.info("No golden examples yet. This first run will build them after QA review.")
 
     st.markdown("")
+
+    run_target = st.radio(
+        "Which rows to analyze",
+        ["Unanalyzed only", "Stale rows (rubric changed)", "All rows"],
+        horizontal=True,
+        disabled=(len(stale) == 0 and True),
+    ) if len(stale) > 0 else "Unanalyzed only"
+
     if st.button("Run analysis", type="primary"):
         progress = st.progress(0)
         status = st.empty()
@@ -397,7 +424,17 @@ elif step == "2 · Analyze":
         prompt_context = mode["prompt_context"]
         use_examples = st.session_state.study_type == "Recurring" and len(examples) > 0
 
-        indices = unclassified.index.tolist()
+        if run_target == "Stale rows (rubric changed)":
+            target_df = stale
+        elif run_target == "All rows":
+            target_df = df
+        else:
+            target_df = unclassified
+
+        if "Rubric Version" not in df.columns:
+            df["Rubric Version"] = ""
+
+        indices = target_df.index.tolist()
         for i, idx in enumerate(indices):
             row = df.loc[idx]
             status.text(f"Analyzing row {i + 1} of {len(indices)}")
@@ -421,6 +458,7 @@ elif step == "2 · Analyze":
                 df.at[idx, "Confidence"] = result.get("confidence", "")
                 df.at[idx, "AI Notes"] = result.get("ai_notes", "")
                 df.at[idx, "Value Check"] = check_values(result, allowed)
+                df.at[idx, "Rubric Version"] = current_version
             except Exception as e:
                 errors += 1
                 df.at[idx, "AI Notes"] = f"ERROR: {e}"
@@ -527,6 +565,35 @@ elif step == "4 · QA Review":
         else:
             st.success(f"Agreement is {agreement:.1f}% — passes the {AGREEMENT_THRESHOLD}% threshold.")
 
+    # Confidence calibration chart
+    if reviewed >= 5:
+        st.markdown("### Confidence calibration")
+        st.caption("How well did the AI's confidence score predict actual accuracy?")
+        calib_data = []
+        for i, (_, row) in enumerate(sample.iterrows()):
+            r = reviews.get(i, {})
+            if r.get("status") in ("approved", "override"):
+                calib_data.append({
+                    "confidence": str(row.get("Confidence", "unknown")).lower(),
+                    "correct": r["status"] == "approved",
+                })
+        if calib_data:
+            calib_df = pd.DataFrame(calib_data)
+            summary = (
+                calib_df.groupby("confidence")["correct"]
+                .agg(["sum", "count"])
+                .rename(columns={"sum": "Approved", "count": "Reviewed"})
+                .reset_index()
+            )
+            summary["Accuracy"] = (summary["Approved"] / summary["Reviewed"] * 100).round(1)
+            summary["confidence"] = pd.Categorical(summary["confidence"], ["high", "medium", "low"])
+            summary = summary.sort_values("confidence").rename(columns={"confidence": "Confidence"})
+            st.dataframe(
+                summary[["Confidence", "Reviewed", "Approved", "Accuracy"]],
+                use_container_width=True, hide_index=True,
+            )
+            st.bar_chart(summary.set_index("Confidence")["Accuracy"], color="#009FD9")
+
     st.divider()
 
     dim_cols = [dim.lower().replace(" ", "_").replace("_", " ").title() for dim in allowed]
@@ -537,27 +604,40 @@ elif step == "4 · QA Review":
         if saved.get("status") and saved["status"] != "pending":
             label += f"  [{saved['status']}]"
         with st.expander(label):
-            for col in dim_cols:
-                if col in row:
-                    st.markdown(f"**{col}:** {row[col]}")
-            st.markdown(f"**Confidence:** {row.get('Confidence', '')}")
-            st.caption(f"AI notes: {row.get('AI Notes', '')}")
-            st.markdown("")
+            # Side-by-side diff view
+            ai_col, override_col = st.columns(2)
+            with ai_col:
+                st.markdown('<div style="font-size:0.72rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#676d73;margin-bottom:0.5rem">AI output</div>', unsafe_allow_html=True)
+                for col in dim_cols:
+                    if col in row:
+                        st.markdown(f"**{col}:** {row[col]}")
+                st.markdown(f"**Confidence:** {row.get('Confidence', '')}")
+                st.caption(f"Notes: {row.get('AI Notes', '')}")
 
-            c1, c2 = st.columns([1, 2])
-            status = c1.selectbox(
-                "Status", ["pending", "approved", "override", "skip"],
-                index=["pending", "approved", "override", "skip"].index(saved.get("status", "pending")),
-                key=f"status_{i}",
-            )
-            notes = c2.text_input("Reviewer notes", value=saved.get("notes", ""), key=f"notes_{i}")
+            with override_col:
+                st.markdown('<div style="font-size:0.72rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#676d73;margin-bottom:0.5rem">Human review</div>', unsafe_allow_html=True)
+                status = st.selectbox(
+                    "Status", ["pending", "approved", "override", "skip"],
+                    index=["pending", "approved", "override", "skip"].index(saved.get("status", "pending")),
+                    key=f"status_{i}",
+                )
+                notes = st.text_input("Notes", value=saved.get("notes", ""), key=f"notes_{i}")
 
-            overrides = {}
-            if status == "override":
-                st.markdown("**Corrections**")
-                oc = st.columns(len(dim_cols))
-                for j, col in enumerate(dim_cols):
-                    overrides[col] = oc[j].text_input(col, value=saved.get(f"o_{col}", ""), key=f"o_{col}_{i}")
+                overrides = {}
+                if status == "override":
+                    st.markdown('<div style="font-size:0.8rem;color:#676d73;margin-top:0.5rem">Corrections</div>', unsafe_allow_html=True)
+                    for col in dim_cols:
+                        ai_val = str(row.get(col, ""))
+                        override_val = saved.get(f"o_{col}", "")
+                        field = st.text_input(
+                            col,
+                            value=override_val or ai_val,
+                            key=f"o_{col}_{i}",
+                        )
+                        # Highlight if changed from AI value
+                        if field and field != ai_val:
+                            st.markdown(f'<div style="font-size:0.72rem;color:#009FD9">Changed from: {ai_val}</div>', unsafe_allow_html=True)
+                        overrides[col] = field
 
             if st.button("Save", key=f"save_{i}"):
                 reviews[i] = {"status": status, "notes": notes, **{f"o_{col}": v for col, v in overrides.items()}}
