@@ -2,7 +2,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from config.settings import REQUIRED_COLUMNS, CLASSIFICATION_COLUMNS, AGREEMENT_THRESHOLD
+from config.settings import CLASSIFICATION_COLUMNS, AGREEMENT_THRESHOLD
 from pipeline.classify import build_rubric_context, classify_row, check_values
 from pipeline.sampling import required_sample_size, sample_rows
 
@@ -15,9 +15,41 @@ for key, default in {
     "rubric": None,
     "qa_sample": None,
     "qa_reviews": {},
+    "t_col_map": None,
+    "r_col_map": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+
+def _autodetect(columns: list[str], candidates: list[str]) -> str:
+    """Return the first column name that fuzzy-matches any candidate keyword."""
+    for col in columns:
+        for c in candidates:
+            if c.lower() in col.lower():
+                return col
+    return columns[0]
+
+
+def map_columns(df: pd.DataFrame, field_hints: dict, key_prefix: str) -> dict:
+    """
+    Render a row of selectboxes — one per required field — and return
+    a {internal_name: selected_column} mapping.
+    field_hints: {internal_name: [keyword hints for autodetect]}
+    """
+    cols = df.columns.tolist()
+    mapping = {}
+    ui_cols = st.columns(len(field_hints))
+    for i, (field, hints) in enumerate(field_hints.items()):
+        default = _autodetect(cols, hints)
+        idx = cols.index(default)
+        mapping[field] = ui_cols[i].selectbox(
+            f"Which column is **{field}**?",
+            options=cols,
+            index=idx,
+            key=f"{key_prefix}_{field}",
+        )
+    return mapping
 
 # ── Sidebar navigation ──────────────────────────────────────────
 step = st.sidebar.radio(
@@ -37,35 +69,71 @@ step = st.sidebar.radio(
 if step == "1 · Upload Data":
     st.header("Step 1 · Upload Data")
 
-    col1, col2 = st.columns(2)
+    # ── Transcripts ──
+    st.subheader("Transcripts")
+    t_file = st.file_uploader("Upload your transcripts CSV", type="csv", key="t_upload")
+    if t_file:
+        raw_df = pd.read_csv(t_file, encoding="utf-8-sig")
+        raw_df.columns = raw_df.columns.str.strip()
+        st.success(f"Detected {len(raw_df)} rows and {len(raw_df.columns)} columns.")
 
-    with col1:
-        st.subheader("Transcripts CSV")
-        t_file = st.file_uploader("Upload transcripts", type="csv", key="t_upload")
-        if t_file:
-            df = pd.read_csv(t_file, encoding="utf-8-sig")
-            df.columns = df.columns.str.strip()
-            missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-            if missing:
-                st.error(f"Missing required columns: {', '.join(missing)}")
-                st.caption(f"Columns found: {', '.join(df.columns.tolist())}")
-            else:
-                for col in CLASSIFICATION_COLUMNS:
-                    if col not in df.columns:
-                        df[col] = ""
-                st.session_state.transcripts = df
-                st.success(f"Loaded {len(df)} rows.")
-                st.dataframe(df.head(), use_container_width=True)
+        st.markdown("**Map your columns** — select which column in your file corresponds to each field:")
+        t_map = map_columns(
+            raw_df,
+            {
+                "Date":                 ["date", "created", "timestamp", "time"],
+                "Transcript":           ["transcript", "conversation", "chat", "text", "body"],
+                "User Request Summary": ["summary", "request", "user request", "description", "issue"],
+            },
+            key_prefix="t",
+        )
 
-    with col2:
-        st.subheader("Rubric CSV")
-        r_file = st.file_uploader("Upload rubric", type="csv", key="r_upload")
-        if r_file:
-            rdf = pd.read_csv(r_file, encoding="utf-8-sig")
-            rdf.columns = rdf.columns.str.strip()
+        if st.button("✅ Confirm Transcript Mapping", type="primary"):
+            df = raw_df.rename(columns={v: k for k, v in t_map.items()})
+            for col in CLASSIFICATION_COLUMNS:
+                if col not in df.columns:
+                    df[col] = ""
+            st.session_state.transcripts = df
+            st.session_state.t_col_map = t_map
+            st.rerun()
+
+    if st.session_state.transcripts is not None:
+        st.success(f"✅ Transcripts ready — {len(st.session_state.transcripts)} rows loaded.")
+        with st.expander("Preview"):
+            st.dataframe(st.session_state.transcripts.head(), use_container_width=True)
+
+    st.divider()
+
+    # ── Rubric ──
+    st.subheader("Rubric")
+    r_file = st.file_uploader("Upload your rubric CSV", type="csv", key="r_upload")
+    if r_file:
+        raw_rdf = pd.read_csv(r_file, encoding="utf-8-sig")
+        raw_rdf.columns = raw_rdf.columns.str.strip()
+        st.success(f"Detected {len(raw_rdf)} rows and {len(raw_rdf.columns)} columns.")
+
+        st.markdown("**Map your columns:**")
+        r_map = map_columns(
+            raw_rdf,
+            {
+                "Dimension Name":                   ["dimension", "name", "category", "label"],
+                "Possible Values (comma-separated)": ["values", "possible", "options", "allowed"],
+                "What This Measures":               ["measures", "description", "what", "definition"],
+                "Active?":                          ["active", "enabled", "include", "use"],
+            },
+            key_prefix="r",
+        )
+
+        if st.button("✅ Confirm Rubric Mapping", type="primary"):
+            rdf = raw_rdf.rename(columns={v: k for k, v in r_map.items()})
             st.session_state.rubric = rdf
-            st.success(f"Loaded {len(rdf)} rubric dimensions.")
-            st.dataframe(rdf, use_container_width=True)
+            st.session_state.r_col_map = r_map
+            st.rerun()
+
+    if st.session_state.rubric is not None:
+        st.success(f"✅ Rubric ready — {len(st.session_state.rubric)} dimensions loaded.")
+        with st.expander("Preview"):
+            st.dataframe(st.session_state.rubric, use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════
 # STEP 2 — Classify
