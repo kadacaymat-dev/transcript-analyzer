@@ -43,10 +43,12 @@ if step == "1 · Upload Data":
         st.subheader("Transcripts CSV")
         t_file = st.file_uploader("Upload transcripts", type="csv", key="t_upload")
         if t_file:
-            df = pd.read_csv(t_file)
+            df = pd.read_csv(t_file, encoding="utf-8-sig")
+            df.columns = df.columns.str.strip()
             missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
             if missing:
                 st.error(f"Missing required columns: {', '.join(missing)}")
+                st.caption(f"Columns found: {', '.join(df.columns.tolist())}")
             else:
                 for col in CLASSIFICATION_COLUMNS:
                     if col not in df.columns:
@@ -59,7 +61,8 @@ if step == "1 · Upload Data":
         st.subheader("Rubric CSV")
         r_file = st.file_uploader("Upload rubric", type="csv", key="r_upload")
         if r_file:
-            rdf = pd.read_csv(r_file)
+            rdf = pd.read_csv(r_file, encoding="utf-8-sig")
+            rdf.columns = rdf.columns.str.strip()
             st.session_state.rubric = rdf
             st.success(f"Loaded {len(rdf)} rubric dimensions.")
             st.dataframe(rdf, use_container_width=True)
