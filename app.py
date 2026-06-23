@@ -11,7 +11,154 @@ from pipeline.golden_set import (
 from pipeline.sampling import required_sample_size, sample_rows
 
 st.set_page_config(page_title="Text Analyzer", layout="wide")
-st.title("📊 Text Analyzer")
+
+# ── Thumbtack design system ──────────────────────────────────────
+st.markdown("""
+<style>
+/* ── Palette ──────────────────────────────────────────────────
+   Blue     #009FD9   primary actions, links, progress
+   White    #FFFFFF   page background
+   Gray200  #FAFAFA   sidebar, card backgrounds
+   Gray300  #E9ECED   borders, dividers
+   Gray     #d3d4d5   muted borders
+   Black300 #676d73   secondary text, captions
+   Black    #2F3033   headings, body text
+   Indigo   #5968e2   metrics, badges
+   Green    #2db783   success states
+   Yellow   #febe14   warnings
+   Purple   #a97ff0   accents
+   Red      #ff5a5f   errors, destructive
+*/
+
+/* Page & sidebar */
+[data-testid="stAppViewContainer"] { background: #FFFFFF; }
+[data-testid="stSidebar"] { background: #FAFAFA; border-right: 1px solid #E9ECED; }
+[data-testid="stSidebar"] * { color: #2F3033; }
+
+/* Typography */
+h1 { color: #2F3033 !important; font-weight: 700 !important; border-bottom: 3px solid #009FD9; padding-bottom: 0.4rem; }
+h2 { color: #2F3033 !important; font-weight: 600 !important; }
+h3 { color: #676d73 !important; font-weight: 600 !important; }
+p, li, label { color: #2F3033 !important; }
+.stCaption, small { color: #676d73 !important; }
+
+/* Primary buttons → TT Blue */
+.stButton > button[kind="primary"] {
+    background: #009FD9 !important;
+    color: #FFFFFF !important;
+    border: none !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    padding: 0.5rem 1.25rem !important;
+}
+.stButton > button[kind="primary"]:hover {
+    background: #007fb0 !important;
+}
+
+/* Secondary buttons */
+.stButton > button:not([kind="primary"]) {
+    background: #FFFFFF !important;
+    color: #009FD9 !important;
+    border: 1.5px solid #009FD9 !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
+.stButton > button:not([kind="primary"]):hover {
+    background: #FAFAFA !important;
+}
+
+/* Disabled buttons */
+.stButton > button:disabled {
+    background: #E9ECED !important;
+    color: #676d73 !important;
+    border: none !important;
+}
+
+/* Metrics */
+[data-testid="stMetric"] {
+    background: #FAFAFA;
+    border: 1px solid #E9ECED;
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+}
+[data-testid="stMetricLabel"] { color: #676d73 !important; font-size: 0.8rem !important; }
+[data-testid="stMetricValue"] { color: #5968e2 !important; font-weight: 700 !important; }
+[data-testid="stMetricDelta"] { font-size: 0.78rem !important; }
+
+/* Alert / info boxes */
+[data-testid="stAlert"][data-baseweb="notification"][kind="info"] {
+    background: #e8f7fd !important; border-left: 4px solid #009FD9 !important; border-radius: 6px;
+}
+[data-testid="stAlert"][data-baseweb="notification"][kind="success"] {
+    background: #e6f7f1 !important; border-left: 4px solid #2db783 !important; border-radius: 6px;
+}
+[data-testid="stAlert"][data-baseweb="notification"][kind="warning"] {
+    background: #fff8e1 !important; border-left: 4px solid #febe14 !important; border-radius: 6px;
+}
+[data-testid="stAlert"][data-baseweb="notification"][kind="error"] {
+    background: #fff0f0 !important; border-left: 4px solid #ff5a5f !important; border-radius: 6px;
+}
+
+/* Expanders */
+[data-testid="stExpander"] {
+    border: 1px solid #E9ECED !important;
+    border-radius: 8px !important;
+    background: #FAFAFA !important;
+}
+
+/* Dataframes */
+[data-testid="stDataFrame"] { border: 1px solid #E9ECED; border-radius: 8px; overflow: hidden; }
+
+/* File uploader */
+[data-testid="stFileUploader"] {
+    border: 2px dashed #009FD9 !important;
+    border-radius: 8px !important;
+    background: #FAFAFA !important;
+}
+
+/* Selectboxes & inputs */
+[data-baseweb="select"] > div { border-color: #d3d4d5 !important; border-radius: 6px !important; }
+[data-baseweb="input"] > div  { border-color: #d3d4d5 !important; border-radius: 6px !important; }
+
+/* Progress bar */
+[data-testid="stProgressBar"] > div > div { background: #009FD9 !important; }
+
+/* Sidebar radio steps */
+[data-testid="stSidebarNav"] { display: none; }
+div[role="radiogroup"] label {
+    border-radius: 6px !important;
+    padding: 0.35rem 0.75rem !important;
+    margin-bottom: 2px !important;
+    transition: background 0.15s;
+}
+div[role="radiogroup"] label:hover { background: #E9ECED !important; }
+
+/* Dividers */
+hr { border-color: #E9ECED !important; }
+
+/* Download buttons */
+.stDownloadButton > button {
+    background: #FAFAFA !important;
+    color: #009FD9 !important;
+    border: 1.5px solid #009FD9 !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Logo / header ────────────────────────────────────────────────
+st.markdown("""
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:0.25rem">
+  <div style="width:36px;height:36px;background:#009FD9;border-radius:8px;
+              display:flex;align-items:center;justify-content:center;
+              font-size:20px;line-height:1">📊</div>
+  <div>
+    <div style="font-size:1.5rem;font-weight:700;color:#2F3033;line-height:1.2">Text Analyzer</div>
+    <div style="font-size:0.8rem;color:#676d73">Thumbtack · Data & Analytics</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 # ── Session state ───────────────────────────────────────────────
 for key, default in {
