@@ -19,6 +19,135 @@ CLASSIFICATION_COLUMNS = [
 CONFIDENCE_LEVELS = ["high", "medium", "low"]
 AGREEMENT_THRESHOLD = 80
 
+# Pre-built rubric templates — each has a name, description, best-fit mode, and dimensions list
+RUBRIC_TEMPLATES = {
+    "Contact Driver": {
+        "label": "Contact Driver Analysis",
+        "description": "What drove customers or pros to reach out this week? Categorize the primary reason for contact.",
+        "mode": "Transcript Analysis",
+        "example_prompt": "Understand what drove contacts this week",
+        "dimensions": [
+            {
+                "name": "Contact Driver",
+                "values": ["billing / charges", "account issue", "lead quality", "technical issue", "policy question", "dispute / refund", "general inquiry", "other"],
+                "description": "The primary reason the customer or pro reached out.",
+            },
+            {
+                "name": "User Type",
+                "values": ["customer", "pro", "unclear"],
+                "description": "Whether the contact came from a customer or a Thumbtack pro.",
+            },
+            {
+                "name": "Resolution",
+                "values": ["resolved", "escalated", "unresolved", "unclear"],
+                "description": "Whether the issue was resolved during the interaction.",
+            },
+            {
+                "name": "Sentiment",
+                "values": ["positive", "neutral", "frustrated", "angry"],
+                "description": "Overall emotional tone of the contact.",
+            },
+        ],
+    },
+    "Escalation Patterns": {
+        "label": "Escalation Pattern Analysis",
+        "description": "Why are conversations escalating to a live agent? Identify triggers and failure modes.",
+        "mode": "Transcript Analysis",
+        "example_prompt": "Identify why conversations escalated and what the AI failed to handle",
+        "dimensions": [
+            {
+                "name": "Escalation Trigger",
+                "values": ["explicit request", "repeated misunderstanding", "complex issue", "emotional distress", "policy limitation", "technical failure", "unclear"],
+                "description": "What caused the conversation to escalate to a human agent.",
+            },
+            {
+                "name": "AI Failure Mode",
+                "values": ["wrong answer", "loop / repetition", "missing knowledge", "tone mismatch", "no failure", "unclear"],
+                "description": "How the AI bot fell short before escalation.",
+            },
+            {
+                "name": "Issue Category",
+                "values": ["billing", "account", "leads", "reviews", "technical", "policy", "other"],
+                "description": "The subject matter of the escalated conversation.",
+            },
+            {
+                "name": "Avoidable",
+                "values": ["yes", "no", "unclear"],
+                "description": "Whether the escalation could have been prevented with a better AI response.",
+            },
+        ],
+    },
+    "CSAT Pain Points": {
+        "label": "CSAT / Survey Pain Point Analysis",
+        "description": "What are customers complaining or praising about? Surface themes from survey comments.",
+        "mode": "Survey / CSAT",
+        "example_prompt": "Identify key pain points and themes in recent survey comments",
+        "dimensions": [
+            {
+                "name": "Primary Theme",
+                "values": ["pricing", "lead quality", "customer service", "product / ux", "pro quality", "communication", "billing", "other"],
+                "description": "The main topic the respondent is commenting on.",
+            },
+            {
+                "name": "Sentiment",
+                "values": ["positive", "negative", "mixed", "neutral"],
+                "description": "The overall tone of the feedback.",
+            },
+            {
+                "name": "Actionability",
+                "values": ["specific and actionable", "vague", "praise only", "unclear"],
+                "description": "How actionable the feedback is for the product or ops team.",
+            },
+        ],
+    },
+    "Thumbtack Numbers": {
+        "label": "Thumbtack Numbers Discussion",
+        "description": "Did the conversation include discussion of specific Thumbtack numbers — pricing, credits, stats, or metrics?",
+        "mode": "Transcript Analysis",
+        "example_prompt": "Identify calls that had discussion about Thumbtack numbers",
+        "dimensions": [
+            {
+                "name": "Numbers Discussed",
+                "values": ["yes", "no", "unclear"],
+                "description": "Whether any specific Thumbtack numbers were mentioned in the conversation.",
+            },
+            {
+                "name": "Number Type",
+                "values": ["lead pricing", "credits / refunds", "account stats", "platform metrics", "not applicable"],
+                "description": "What category of numbers came up.",
+            },
+            {
+                "name": "Customer Reaction",
+                "values": ["accepted", "disputed", "confused", "not applicable"],
+                "description": "How the customer responded to the numbers discussed.",
+            },
+        ],
+    },
+    "Feature Mentions": {
+        "label": "Feature & Product Mention Tracker",
+        "description": "Which Thumbtack features or product areas came up in the conversation?",
+        "mode": "Transcript Analysis",
+        "example_prompt": "Track which product features or areas were mentioned",
+        "dimensions": [
+            {
+                "name": "Feature Area",
+                "values": ["leads / targeting", "payments", "reviews", "profile", "messaging", "background check", "app / technical", "other", "none"],
+                "description": "The Thumbtack product area mentioned in the conversation.",
+            },
+            {
+                "name": "Mention Type",
+                "values": ["complaint", "question", "praise", "informational", "not applicable"],
+                "description": "How the feature was brought up.",
+            },
+            {
+                "name": "Outcome",
+                "values": ["resolved", "referred to help center", "escalated", "not applicable"],
+                "description": "How the feature-related discussion was handled.",
+            },
+        ],
+    },
+}
+
 # Each mode defines:
 #   label        — display name
 #   description  — shown as helper text

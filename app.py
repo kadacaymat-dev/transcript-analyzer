@@ -3,7 +3,7 @@ import datetime
 import pandas as pd
 import streamlit as st
 
-from config.settings import AGREEMENT_THRESHOLD, ANALYSIS_MODES
+from config.settings import AGREEMENT_THRESHOLD, ANALYSIS_MODES, RUBRIC_TEMPLATES
 from pipeline.classify import build_rubric_context, classify_row, check_values, rubric_hash
 from pipeline.golden_set import (
     new_golden_set, load_golden_set, export_golden_set,
@@ -11,6 +11,7 @@ from pipeline.golden_set import (
 )
 from pipeline.sampling import required_sample_size, sample_rows
 from pipeline.bq_connector import fetch_maven_conversations, get_channel_counts, CHANNELS
+from pipeline.rubric_builder import generate_rubric_from_description, rubric_from_template
 
 st.set_page_config(page_title="Text Analyzer", layout="wide")
 
@@ -177,8 +178,10 @@ for key, default in {
     "qa_reviews": {},
     "t_col_map": None,
     "r_col_map": None,
-    "calib_samples": None,   # list of classified sample dicts for calibration round
-    "calib_reviews": {},     # {index: "up"|"down"}
+    "calib_samples": None,    # list of classified sample dicts for calibration round
+    "calib_reviews": {},      # {index: "up"|"down"}
+    "rubric_draft": None,     # rubric being edited before confirm
+    "selected_template": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -205,7 +208,7 @@ if is_setup_done:
         unsafe_allow_html=True,
     )
     if st.sidebar.button("Change setup", use_container_width=True):
-        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews", "calib_samples", "calib_reviews"]:
+        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews", "calib_samples", "calib_reviews", "rubric_draft", "selected_template"]:
             st.session_state[k] = None if k not in ("qa_reviews", "series_name") else ({} if k == "qa_reviews" else "")
         st.rerun()
     st.sidebar.divider()
@@ -394,32 +397,137 @@ elif step == "1 · Upload Data":
 
     st.divider()
 
-    st.markdown("### Rubric file")
-    r_file = st.file_uploader("Upload a rubric CSV", type="csv", key="r_upload", label_visibility="collapsed")
-    if r_file:
-        raw_rdf = pd.read_csv(r_file, encoding="utf-8-sig")
-        raw_rdf.columns = raw_rdf.columns.str.strip()
-        st.success(f"{len(raw_rdf)} dimensions detected.")
+    st.markdown("### Rubric")
+    rubric_source = st.radio(
+        "How do you want to define your rubric?",
+        ["Describe it in plain English", "Pick a template", "Upload a CSV"],
+        horizontal=True,
+        key="rubric_source",
+    )
 
-        st.markdown("**Map your columns.**")
-        r_map = map_columns(raw_rdf, {
-            "Dimension Name": ["dimension", "name", "category", "label"],
-            "Possible Values (comma-separated)": ["values", "possible", "options", "allowed"],
-            "What This Measures": ["measures", "description", "what", "definition"],
-            "Active?": ["active", "enabled", "include", "use"],
-        }, key_prefix="r")
+    # ── Option A: Plain-English description ─────────────────────
+    if rubric_source == "Describe it in plain English":
+        st.caption("Describe what you want to find out. The AI will generate the rubric dimensions for you.")
 
-        if st.button("Confirm rubric", type="primary"):
-            rdf = raw_rdf.rename(columns={v: k for k, v in r_map.items()})
-            st.session_state.rubric = rdf
-            st.session_state.r_col_map = r_map
-            st.session_state.rubric_version = rubric_hash(rdf)
-            st.rerun()
+        example_prompts = [
+            "Review transcripts and identify calls that had discussion about Thumbtack numbers",
+            "Understand what drove contacts this week",
+            "Identify why conversations escalated and what the AI failed to handle",
+            "Analyze survey comments and identify key pain points and themes",
+            "Track which Thumbtack product features were mentioned and how customers reacted",
+        ]
+        selected_example = st.selectbox(
+            "Need inspiration? Pick an example or write your own below:",
+            [""] + example_prompts,
+            key="rubric_example_pick",
+        )
+
+        description = st.text_area(
+            "Research question",
+            value=selected_example,
+            height=100,
+            placeholder="e.g. Review the transcripts and identify interactions where customers discussed Thumbtack pricing or credits",
+            key="rubric_description",
+            label_visibility="collapsed",
+        )
+
+        if st.button("Generate rubric", type="primary", key="rubric_generate", disabled=not description.strip()):
+            with st.spinner("Generating rubric dimensions..."):
+                try:
+                    mode_ctx = ANALYSIS_MODES[st.session_state.analysis_mode]["prompt_context"]
+                    rdf = generate_rubric_from_description(description.strip(), mode_ctx)
+                    st.session_state.rubric_draft = rdf
+                except Exception as e:
+                    st.error(f"Could not generate rubric: {e}")
+
+    # ── Option B: Template picker ────────────────────────────────
+    elif rubric_source == "Pick a template":
+        st.caption("Pre-built rubrics for the most common analysis types. Select one to preview and use.")
+
+        tmpl_names = list(RUBRIC_TEMPLATES.keys())
+        tmpl_cols = st.columns(min(len(tmpl_names), 3))
+        selected_tmpl = st.session_state.get("selected_template")
+
+        for i, key in enumerate(tmpl_names):
+            tmpl = RUBRIC_TEMPLATES[key]
+            is_active = selected_tmpl == key
+            border = "#009FD9" if is_active else "#E9ECED"
+            bg = "#f0fafd" if is_active else "#FAFAFA"
+            with tmpl_cols[i % 3]:
+                st.markdown(
+                    f'<div style="border:1.5px solid {border};background:{bg};border-radius:8px;'
+                    f'padding:0.75rem;margin-bottom:0.5rem;min-height:90px">'
+                    f'<div style="font-size:0.85rem;font-weight:600;color:#2F3033">{tmpl["label"]}</div>'
+                    f'<div style="font-size:0.78rem;color:#676d73;margin-top:0.25rem">{tmpl["description"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button("Select", key=f"tmpl_{key}", use_container_width=True):
+                    st.session_state.selected_template = key
+                    rdf = rubric_from_template(tmpl)
+                    st.session_state.rubric_draft = rdf
+                    st.rerun()
+
+    # ── Option C: CSV upload ─────────────────────────────────────
+    else:
+        r_file = st.file_uploader("Upload a rubric CSV", type="csv", key="r_upload", label_visibility="collapsed")
+        if r_file:
+            raw_rdf = pd.read_csv(r_file, encoding="utf-8-sig")
+            raw_rdf.columns = raw_rdf.columns.str.strip()
+            st.success(f"{len(raw_rdf)} dimensions detected.")
+            st.markdown("**Map your columns.**")
+            r_map = map_columns(raw_rdf, {
+                "Dimension Name": ["dimension", "name", "category", "label"],
+                "Possible Values (comma-separated)": ["values", "possible", "options", "allowed"],
+                "What This Measures": ["measures", "description", "what", "definition"],
+                "Active?": ["active", "enabled", "include", "use"],
+            }, key_prefix="r")
+            if st.button("Confirm rubric", type="primary", key="rubric_csv_confirm"):
+                rdf = raw_rdf.rename(columns={v: k for k, v in r_map.items()})
+                st.session_state.rubric = rdf
+                st.session_state.rubric_draft = None
+                st.session_state.rubric_version = rubric_hash(rdf)
+                st.rerun()
+
+    # ── Inline editor — shown after generate or template select ──
+    draft = st.session_state.get("rubric_draft")
+    if draft is not None and rubric_source != "Upload a CSV":
+        st.markdown("#### Review and edit before confirming")
+        st.caption("Add, remove, or edit dimensions and values. Changes here update the rubric before any analysis runs.")
+
+        edited = st.data_editor(
+            draft,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Dimension Name": st.column_config.TextColumn("Dimension Name", width="medium"),
+                "Possible Values (comma-separated)": st.column_config.TextColumn("Possible Values (comma-separated)", width="large"),
+                "What This Measures": st.column_config.TextColumn("What This Measures", width="large"),
+                "Active?": st.column_config.SelectboxColumn("Active?", options=["yes", "no"], width="small"),
+            },
+            key="rubric_editor",
+        )
+
+        col_confirm, col_reset = st.columns([2, 1])
+        with col_confirm:
+            if st.button("Confirm rubric", type="primary", key="rubric_draft_confirm"):
+                st.session_state.rubric = edited
+                st.session_state.rubric_draft = None
+                st.session_state.rubric_version = rubric_hash(edited)
+                st.rerun()
+        with col_reset:
+            if st.button("Discard", key="rubric_draft_discard"):
+                st.session_state.rubric_draft = None
+                st.rerun()
 
     if st.session_state.rubric is not None:
-        st.success(f"{len(st.session_state.rubric)} rubric dimensions loaded.")
+        st.success(f"{len(st.session_state.rubric)} rubric dimensions confirmed.")
         with st.expander("Preview rubric"):
             st.dataframe(st.session_state.rubric, use_container_width=True)
+        if st.button("Edit rubric", key="rubric_reedit"):
+            st.session_state.rubric_draft = st.session_state.rubric.copy()
+            st.session_state.rubric = None
+            st.rerun()
 
     # ── Calibration round (optional, ad-hoc + recurring first run) ──
     both_loaded = st.session_state.transcripts is not None and st.session_state.rubric is not None
