@@ -1,4 +1,5 @@
 import time
+import datetime
 import pandas as pd
 import streamlit as st
 
@@ -9,6 +10,7 @@ from pipeline.golden_set import (
     record_run, add_examples, classify_with_examples,
 )
 from pipeline.sampling import required_sample_size, sample_rows
+from pipeline.bq_connector import fetch_maven_conversations, get_channel_counts, CHANNELS
 
 st.set_page_config(page_title="Text Analyzer", layout="wide")
 
@@ -299,29 +301,94 @@ elif step == "1 · Upload Data":
         mode = ANALYSIS_MODES[new_mode]
     st.caption(mode["description"])
 
-    st.markdown("### Data file")
-    t_file = st.file_uploader("Upload a CSV file", type="csv", key="t_upload", label_visibility="collapsed")
-    if t_file:
-        raw_df = pd.read_csv(t_file, encoding="utf-8-sig")
-        raw_df.columns = raw_df.columns.str.strip()
-        st.success(f"{len(raw_df)} rows detected across {len(raw_df.columns)} columns.")
+    st.markdown("### Data source")
+    data_source = st.radio(
+        "Where is your data coming from?",
+        ["Upload a CSV", "Pull from BigQuery (Maven)"],
+        horizontal=True,
+        key="data_source_radio",
+    )
 
-        st.markdown("**Map your columns** — select which column corresponds to each required field.")
-        t_map = map_columns(raw_df, mode["text_fields"], key_prefix="t")
+    if data_source == "Upload a CSV":
+        t_file = st.file_uploader("Upload a CSV file", type="csv", key="t_upload", label_visibility="collapsed")
+        if t_file:
+            raw_df = pd.read_csv(t_file, encoding="utf-8-sig")
+            raw_df.columns = raw_df.columns.str.strip()
+            st.success(f"{len(raw_df)} rows detected across {len(raw_df.columns)} columns.")
 
-        if st.button("Confirm mapping", type="primary"):
-            df = raw_df.rename(columns={v: k for k, v in t_map.items()})
-            for col in ["Confidence", "AI Notes", "Value Check"]:
-                if col not in df.columns:
-                    df[col] = ""
-            st.session_state.transcripts = df
-            st.session_state.t_col_map = t_map
-            st.rerun()
+            st.markdown("**Map your columns** — select which column corresponds to each required field.")
+            t_map = map_columns(raw_df, mode["text_fields"], key_prefix="t")
+
+            if st.button("Confirm mapping", type="primary"):
+                df = raw_df.rename(columns={v: k for k, v in t_map.items()})
+                for col in ["Confidence", "AI Notes", "Value Check"]:
+                    if col not in df.columns:
+                        df[col] = ""
+                st.session_state.transcripts = df
+                st.session_state.t_col_map = t_map
+                st.rerun()
+
+    else:
+        # ── BigQuery: Maven SMS / Chat / Voice ──────────────────
+        st.markdown("#### Maven conversation filters")
+        st.caption("Pulls from `tt-dp-prod.maven.conversations` + `maven.messages`. Requires GCP access via ADC.")
+
+        bq_col1, bq_col2, bq_col3 = st.columns(3)
+        today = datetime.date.today()
+        default_start = today - datetime.timedelta(days=30)
+
+        start_date = bq_col1.date_input("Start date", value=default_start, key="bq_start")
+        end_date = bq_col2.date_input("End date", value=today, key="bq_end")
+        channel = bq_col3.selectbox("Channel", ["all"] + CHANNELS, key="bq_channel")
+
+        bq_col4, bq_col5 = st.columns(2)
+        escalated_only = bq_col4.checkbox("Escalated conversations only", value=False, key="bq_escalated")
+        row_limit = bq_col5.number_input("Max rows", min_value=10, max_value=2000, value=300, step=50, key="bq_limit")
+
+        if st.button("Check availability", key="bq_check"):
+            with st.spinner("Querying BigQuery..."):
+                try:
+                    counts = get_channel_counts(str(start_date), str(end_date))
+                    if counts:
+                        count_df = pd.DataFrame([
+                            {"Channel": ch, "Conversations": n}
+                            for ch, n in counts.items()
+                        ])
+                        st.dataframe(count_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("No conversations found for this date range.")
+                except Exception as e:
+                    st.error(f"BigQuery error: {e}")
+
+        if st.button("Pull conversations", type="primary", key="bq_pull"):
+            with st.spinner("Pulling from BigQuery — this may take 10-30 seconds..."):
+                try:
+                    df = fetch_maven_conversations(
+                        channel=channel,
+                        start_date=str(start_date),
+                        end_date=str(end_date),
+                        escalated_only=escalated_only,
+                        limit=int(row_limit),
+                    )
+                    if df.empty:
+                        st.warning("No rows returned. Try adjusting the date range or filters.")
+                    else:
+                        for col in ["Confidence", "AI Notes", "Value Check"]:
+                            df[col] = ""
+                        st.session_state.transcripts = df
+                        st.session_state.t_col_map = {"Text": "Text", "Summary": "Summary", "Date": "Date"}
+                        st.success(f"Pulled {len(df)} conversations from BigQuery.")
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"BigQuery error: {e}")
 
     if st.session_state.transcripts is not None:
-        st.success(f"{len(st.session_state.transcripts)} rows loaded.")
+        src = "BigQuery" if st.session_state.get("data_source_radio") == "Pull from BigQuery (Maven)" else "file"
+        st.success(f"{len(st.session_state.transcripts)} rows loaded from {src}.")
         with st.expander("Preview data"):
-            st.dataframe(st.session_state.transcripts.head(), use_container_width=True)
+            preview_cols = [c for c in ["Date", "channel", "Summary", "was_escalated", "sentiment", "Text"]
+                            if c in st.session_state.transcripts.columns]
+            st.dataframe(st.session_state.transcripts[preview_cols].head(10), use_container_width=True)
 
     st.divider()
 
