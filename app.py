@@ -177,6 +177,8 @@ for key, default in {
     "qa_reviews": {},
     "t_col_map": None,
     "r_col_map": None,
+    "calib_samples": None,   # list of classified sample dicts for calibration round
+    "calib_reviews": {},     # {index: "up"|"down"}
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -203,7 +205,7 @@ if is_setup_done:
         unsafe_allow_html=True,
     )
     if st.sidebar.button("Change setup", use_container_width=True):
-        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews"]:
+        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews", "calib_samples", "calib_reviews"]:
             st.session_state[k] = None if k not in ("qa_reviews", "series_name") else ({} if k == "qa_reviews" else "")
         st.rerun()
     st.sidebar.divider()
@@ -419,6 +421,113 @@ elif step == "1 · Upload Data":
         with st.expander("Preview rubric"):
             st.dataframe(st.session_state.rubric, use_container_width=True)
 
+    # ── Calibration round (optional, ad-hoc + recurring first run) ──
+    both_loaded = st.session_state.transcripts is not None and st.session_state.rubric is not None
+    if both_loaded:
+        st.divider()
+        st.markdown("### Calibration (optional)")
+        st.caption(
+            "Run 10 sample rows first. Approve or reject each one — approved rows are injected "
+            "as few-shot examples so the AI has better context before the full analysis."
+        )
+
+        # Import an existing golden set JSON for one-off context
+        with st.expander("Import a golden set from a past study"):
+            gs_import = st.file_uploader(
+                "Golden set JSON", type="json", key="gs_import",
+                label_visibility="collapsed",
+            )
+            if gs_import:
+                imported = load_golden_set(gs_import.read())
+                n = len(imported.get("examples", []))
+                if st.button(f"Use these {n} examples", key="gs_import_confirm", type="primary"):
+                    st.session_state.golden_set = imported
+                    st.success(f"Imported {n} examples — will be used in Step 2.")
+                    st.rerun()
+
+        calib_done = bool(st.session_state.calib_samples)
+        approved_count = sum(1 for v in st.session_state.calib_reviews.values() if v == "up")
+
+        if calib_done:
+            st.success(
+                f"Calibration complete — {approved_count} of {len(st.session_state.calib_samples)} "
+                f"samples approved and ready to inject."
+            )
+            if st.button("Re-run calibration", key="calib_rerun"):
+                st.session_state.calib_samples = None
+                st.session_state.calib_reviews = {}
+                st.rerun()
+        else:
+            if st.button("Run 10-sample calibration", type="primary", key="calib_start"):
+                rctx, allowed_c = build_rubric_context(st.session_state.rubric)
+                mode_c = ANALYSIS_MODES[st.session_state.analysis_mode]
+                df_c = st.session_state.transcripts
+                sample_c = df_c.sample(min(10, len(df_c)), random_state=42)
+                samples_out = []
+                prog = st.progress(0)
+                for i, (_, row) in enumerate(sample_c.iterrows()):
+                    prog.progress((i + 1) / len(sample_c))
+                    try:
+                        result = classify_row(
+                            rctx,
+                            str(row.get("Text", "")),
+                            str(row.get("Summary", "")),
+                            prompt_context=mode_c["prompt_context"],
+                        )
+                    except Exception as e:
+                        result = {"ai_notes": f"ERROR: {e}", "confidence": "low"}
+                    samples_out.append({
+                        "text": str(row.get("Text", "")),
+                        "summary": str(row.get("Summary", "")),
+                        "result": result,
+                        "allowed": allowed_c,
+                    })
+                st.session_state.calib_samples = samples_out
+                st.session_state.calib_reviews = {}
+                prog.empty()
+                st.rerun()
+
+        # Review UI — show once samples exist
+        if st.session_state.calib_samples:
+            reviews_c = st.session_state.calib_reviews
+            dim_cols_c = [
+                dim.lower().replace(" ", "_").replace("_", " ").title()
+                for dim in (st.session_state.calib_samples[0].get("allowed") or {})
+            ]
+            for i, s in enumerate(st.session_state.calib_samples):
+                result = s["result"]
+                verdict = reviews_c.get(i)
+                border_color = "#2db783" if verdict == "up" else ("#ff5a5f" if verdict == "down" else "#E9ECED")
+                st.markdown(
+                    f'<div style="border:1.5px solid {border_color};border-radius:8px;'
+                    f'padding:0.75rem 1rem;margin-bottom:0.75rem">',
+                    unsafe_allow_html=True,
+                )
+                hdr, vote_col = st.columns([5, 1])
+                hdr.markdown(
+                    f"**{i+1}.** {s['summary'][:100] or s['text'][:100]}"
+                )
+                with vote_col:
+                    vcol1, vcol2 = st.columns(2)
+                    if vcol1.button("Yes", key=f"up_{i}", type="primary" if verdict == "up" else "secondary"):
+                        reviews_c[i] = "up"
+                        st.session_state.calib_reviews = reviews_c
+                        st.rerun()
+                    if vcol2.button("No", key=f"dn_{i}"):
+                        reviews_c[i] = "down"
+                        st.session_state.calib_reviews = reviews_c
+                        st.rerun()
+
+                with st.expander("AI output", expanded=False):
+                    for col in dim_cols_c:
+                        field = col.lower().replace(" ", "_")
+                        st.markdown(f"**{col}:** {result.get(field, '—')}")
+                    st.markdown(f"**Confidence:** {result.get('confidence', '—')}")
+                    if result.get("ai_notes"):
+                        st.caption(result["ai_notes"])
+                    st.caption(f"Text preview: {s['text'][:300]}")
+                st.markdown("</div>", unsafe_allow_html=True)
+
 # ═══════════════════════════════════════════════════════════════
 # STEP 2 — Analyze
 # ═══════════════════════════════════════════════════════════════
@@ -457,6 +566,24 @@ elif step == "2 · Analyze":
     gs = st.session_state.golden_set
     examples = gs.get("examples", []) if gs else []
 
+    # Merge calibration-approved rows as in-session examples (ad-hoc + recurring)
+    calib_examples = []
+    if st.session_state.calib_samples:
+        for i, s in enumerate(st.session_state.calib_samples):
+            if st.session_state.calib_reviews.get(i) == "up":
+                clf = {
+                    k.lower().replace(" ", "_"): v
+                    for k, v in s["result"].items()
+                    if k not in ("ai_notes", "confidence")
+                }
+                clf["confidence"] = s["result"].get("confidence", "")
+                calib_examples.append({
+                    "text": s["text"],
+                    "summary": s["summary"],
+                    "classifications": clf,
+                })
+    all_examples = calib_examples + examples
+
     c1, c2, c3 = st.columns(3)
     c1.markdown(f'<div class="stat-label">Unanalyzed</div><div class="stat-value">{len(unclassified)}</div>', unsafe_allow_html=True)
     c2.markdown(f'<div class="stat-label">Analyzed</div><div class="stat-value">{len(df) - len(unclassified)}</div>', unsafe_allow_html=True)
@@ -468,12 +595,18 @@ elif step == "2 · Analyze":
             f"Run analysis to update them, or skip to keep existing results."
         )
 
-    if st.session_state.study_type == "Recurring":
-        st.markdown("")
-        if examples:
-            st.info(f"{len(examples)} golden examples will be injected into the prompt to improve accuracy.")
-        else:
-            st.info("No golden examples yet. This first run will build them after QA review.")
+    st.markdown("")
+    if all_examples:
+        calib_n = len(calib_examples)
+        golden_n = len(examples)
+        parts = []
+        if calib_n:
+            parts.append(f"{calib_n} calibration")
+        if golden_n:
+            parts.append(f"{golden_n} golden set")
+        st.info(f"{' + '.join(parts)} examples will be injected into the prompt to improve accuracy.")
+    elif st.session_state.study_type == "Recurring":
+        st.info("No golden examples yet. This first run will build them after QA review.")
 
     st.markdown("")
 
@@ -489,7 +622,7 @@ elif step == "2 · Analyze":
         status = st.empty()
         errors = 0
         prompt_context = mode["prompt_context"]
-        use_examples = st.session_state.study_type == "Recurring" and len(examples) > 0
+        use_examples = len(all_examples) > 0
 
         if run_target == "Stale rows (rubric changed)":
             target_df = stale
@@ -508,7 +641,7 @@ elif step == "2 · Analyze":
             try:
                 if use_examples:
                     result = classify_with_examples(
-                        rubric_context, examples,
+                        rubric_context, all_examples,
                         str(row.get("Text", "")), str(row.get("Summary", "")),
                         prompt_context,
                     )
