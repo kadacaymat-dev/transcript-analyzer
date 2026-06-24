@@ -12,6 +12,12 @@ from pipeline.golden_set import (
 from pipeline.sampling import required_sample_size, sample_rows
 from pipeline.bq_connector import fetch_maven_conversations, get_channel_counts, CHANNELS
 from pipeline.rubric_builder import generate_rubric_from_description, rubric_from_template
+from pipeline.study_profile import (
+    new_profile, load_profile, export_profile, profile_filename,
+    attach_rubric, rubric_from_profile,
+    record_run as profile_record_run,
+    add_examples_to_profile, run_history_df,
+)
 
 st.set_page_config(page_title="Text Analyzer", layout="wide")
 
@@ -180,8 +186,9 @@ for key, default in {
     "r_col_map": None,
     "calib_samples": None,    # list of classified sample dicts for calibration round
     "calib_reviews": {},      # {index: "up"|"down"}
-    "rubric_draft": None,     # rubric being edited before confirm
+    "rubric_draft": None,      # rubric being edited before confirm
     "selected_template": None,
+    "study_profile": None,     # active study profile dict
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -208,7 +215,7 @@ if is_setup_done:
         unsafe_allow_html=True,
     )
     if st.sidebar.button("Change setup", use_container_width=True):
-        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews", "calib_samples", "calib_reviews", "rubric_draft", "selected_template"]:
+        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews", "calib_samples", "calib_reviews", "rubric_draft", "selected_template", "study_profile"]:
             st.session_state[k] = None if k not in ("qa_reviews", "series_name") else ({} if k == "qa_reviews" else "")
         st.rerun()
     st.sidebar.divider()
@@ -234,55 +241,108 @@ if st.session_state.golden_set:
         unsafe_allow_html=True,
     )
 
+if st.session_state.study_profile:
+    sp = st.session_state.study_profile
+    n_runs = len(sp.get("run_history", []))
+    last = sp.get("last_run", "never")
+    st.sidebar.divider()
+    st.sidebar.markdown(
+        f'<div style="font-size:0.75rem;color:#676d73">'
+        f'<span style="color:#2F3033;font-weight:600">Study Profile</span><br>'
+        f'{n_runs} run{"s" if n_runs != 1 else ""} · last {last}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
 # ═══════════════════════════════════════════════════════════════
 # STEP 0 — Study Setup
 # ═══════════════════════════════════════════════════════════════
 if step == "0 · Study Setup":
     page_header("Study Setup", "Choose how you want to run this analysis.")
 
-    col1, col2 = st.columns(2, gap="large")
+    col1, col2, col3 = st.columns(3, gap="large")
 
+    # ── Card 1: Continue a saved study ──────────────────────────
     with col1:
         st.markdown("""
 <div class="study-card">
-<h3>Ad-hoc</h3>
-<p>Fast and disposable. Good for one-off studies where you don't need to build on past results.</p>
+<h3>Continue a saved study</h3>
+<p>Pick up where you left off. Your rubric, examples, and run history are all restored — just upload new data and run.</p>
 <ul>
-<li>No golden dataset</li>
-<li>QA review gates this study only</li>
+<li>Rubric pre-loaded — no setup needed</li>
+<li>AI uses all past approved examples</li>
+<li>Agreement rate and themes tracked over time</li>
+</ul>
+</div>
+""", unsafe_allow_html=True)
+        st.markdown("")
+        profile_file = st.file_uploader(
+            "Upload study profile (.json)",
+            type="json",
+            key="profile_upload",
+            label_visibility="collapsed",
+        )
+        if profile_file:
+            profile = load_profile(profile_file.read())
+            rdf = rubric_from_profile(profile)
+            gs = profile.get("golden_set", {})
+            n_ex = len(gs.get("examples", []))
+            n_runs = len(profile.get("run_history", []))
+            last = profile.get("last_run", "never")
+            st.info(
+                f"**{profile['name']}** · {n_runs} past runs · {n_ex} examples · last run {last}"
+            )
+            if st.button("Continue this study", use_container_width=True, type="primary", key="btn_continue"):
+                st.session_state.study_profile = profile
+                st.session_state.study_type = "Recurring"
+                st.session_state.series_name = profile["name"]
+                st.session_state.analysis_mode = profile.get("analysis_mode", "Transcript Analysis")
+                st.session_state.golden_set = gs
+                if rdf is not None:
+                    st.session_state.rubric = rdf
+                    st.session_state.rubric_version = rubric_hash(rdf)
+                st.rerun()
+
+    # ── Card 2: New recurring study ──────────────────────────────
+    with col2:
+        st.markdown("""
+<div class="study-card">
+<h3>New recurring study</h3>
+<p>Builds institutional knowledge over time. Good for monthly studies — CSAT, escalation reviews, contact drivers.</p>
+<ul>
+<li>Creates a study profile you can reuse each run</li>
+<li>AI improves as you approve more examples</li>
+<li>Agreement rate tracked across runs</li>
+</ul>
+</div>
+""", unsafe_allow_html=True)
+        st.markdown("")
+        series = st.text_input("Study name", placeholder="e.g. Commercial Ops Escalations", key="series_input")
+        if st.button("Start recurring study", use_container_width=True, type="primary",
+                     key="btn_recurring", disabled=not series.strip()):
+            profile = new_profile(series.strip(), st.session_state.analysis_mode)
+            st.session_state.study_type = "Recurring"
+            st.session_state.series_name = series.strip()
+            st.session_state.study_profile = profile
+            st.session_state.golden_set = profile["golden_set"]
+            st.rerun()
+
+    # ── Card 3: Ad-hoc ───────────────────────────────────────────
+    with col3:
+        st.markdown("""
+<div class="study-card">
+<h3>Ad-hoc</h3>
+<p>Fast and disposable. Good for one-off questions where you don't need to build on past results.</p>
+<ul>
+<li>No setup — define rubric and run</li>
+<li>Optional calibration round to warm up the AI</li>
 <li>Export results as CSV when done</li>
 </ul>
 </div>
 """, unsafe_allow_html=True)
         st.markdown("")
-        if st.button("Start ad-hoc study", use_container_width=True, type="primary"):
+        if st.button("Start ad-hoc study", use_container_width=True, type="primary", key="btn_adhoc"):
             st.session_state.study_type = "Ad-hoc"
-            st.rerun()
-
-    with col2:
-        st.markdown("""
-<div class="study-card">
-<h3>Recurring</h3>
-<p>Builds institutional knowledge over time. Good for monthly studies run on the same rubric — CSAT, AHT, escalation reviews.</p>
-<ul>
-<li>Past verified examples improve AI accuracy each run</li>
-<li>Agreement rate tracked across runs</li>
-<li>Golden set is portable — download and re-upload each time</li>
-</ul>
-</div>
-""", unsafe_allow_html=True)
-        st.markdown("")
-        series = st.text_input("Series name", placeholder="e.g. Commercial Ops Escalations", key="series_input")
-        gs_file = st.file_uploader("Golden set JSON (optional — skip for first run)", type="json")
-        if st.button("Start recurring study", use_container_width=True, type="primary", disabled=not series.strip()):
-            st.session_state.study_type = "Recurring"
-            st.session_state.series_name = series.strip()
-            if gs_file:
-                st.session_state.golden_set = load_golden_set(gs_file.read())
-                n = len(st.session_state.golden_set.get("examples", []))
-                st.success(f"Loaded golden set — {n} existing examples.")
-            else:
-                st.session_state.golden_set = new_golden_set(series.strip(), st.session_state.analysis_mode)
             st.rerun()
 
 # ═══════════════════════════════════════════════════════════════
@@ -292,11 +352,22 @@ elif step == "1 · Upload Data":
     page_header("Upload Data")
     mode = ANALYSIS_MODES[st.session_state.analysis_mode]
 
+    # Show profile context banner if continuing a saved study
+    if st.session_state.study_profile:
+        sp = st.session_state.study_profile
+        n_runs = len(sp.get("run_history", []))
+        n_ex = len(sp.get("golden_set", {}).get("examples", []))
+        last = sp.get("last_run", "never")
+        st.info(
+            f"Continuing **{sp['name']}** — {n_runs} past run{'s' if n_runs != 1 else ''} · "
+            f"{n_ex} approved examples · last run {last}"
+        )
+
     gs = st.session_state.golden_set
     if gs and gs.get("mode"):
-        st.info(f"Analysis type locked to {gs['mode']} — set by the golden set series.")
         st.session_state.analysis_mode = gs["mode"]
         mode = ANALYSIS_MODES[gs["mode"]]
+        st.caption(mode["description"])
     else:
         new_mode = st.selectbox("Analysis type", list(ANALYSIS_MODES.keys()),
                                 index=list(ANALYSIS_MODES.keys()).index(st.session_state.analysis_mode))
@@ -304,7 +375,7 @@ elif step == "1 · Upload Data":
             st.session_state.analysis_mode = new_mode
             st.rerun()
         mode = ANALYSIS_MODES[new_mode]
-    st.caption(mode["description"])
+        st.caption(mode["description"])
 
     st.markdown("### Data source")
     data_source = st.radio(
@@ -1088,11 +1159,99 @@ elif step in ("5 · Report", "6 · Report"):
             breakdown["% of Total"] = (breakdown["Count"] / total * 100).round(1).astype(str) + "%"
             st.dataframe(breakdown, use_container_width=True, hide_index=True)
 
-    if st.session_state.study_type == "Recurring" and st.session_state.golden_set:
-        gs = st.session_state.golden_set
-        st.divider()
-        st.markdown(f"**Golden set:** {gs['series']} · {len(gs['examples'])} examples · {len(gs['runs'])} runs")
-
+    # ── Study Profile: save run + download ───────────────────────
     st.divider()
-    csv = classified.to_csv(index=False)
-    st.download_button("Download results (CSV)", csv, "results.csv", "text/csv")
+    profile = st.session_state.study_profile
+
+    if profile is not None or st.session_state.study_type == "Recurring":
+        st.markdown("### Save study profile")
+        st.caption(
+            "Download the updated profile to use next time. It contains your rubric, all approved "
+            "examples, and the full run history — upload it at Step 0 to continue this study."
+        )
+
+        agreement_val = (approved / reviewed * 100) if reviewed > 0 else None
+        top_themes = {}
+        if dim_cols and dim_cols[0] in classified.columns:
+            top_themes = classified[dim_cols[0]].value_counts().head(5).to_dict()
+
+        # Build / update the profile
+        if profile is None:
+            profile = new_profile(
+                st.session_state.series_name or "Untitled Study",
+                st.session_state.analysis_mode,
+            )
+
+        # Attach current rubric
+        if st.session_state.rubric is not None:
+            profile = attach_rubric(profile, st.session_state.rubric)
+
+        # Promote QA-approved rows into profile's golden set
+        dim_cols_lower = [dim.lower().replace(" ", "_").replace("_", " ").title() for dim in allowed]
+        promotable = []
+        if sample is not None:
+            for i, (orig_idx, row) in enumerate(sample.iterrows()):
+                r = reviews.get(i, {})
+                if r.get("status") not in ("approved", "override"):
+                    continue
+                clf = {}
+                for col in dim_cols_lower:
+                    field = col.lower().replace(" ", "_")
+                    clf[field] = r.get(f"o_{col}") or str(row.get(col, ""))
+                clf["confidence"] = str(row.get("Confidence", ""))
+                promotable.append({
+                    "text": str(row.get("Text", "")),
+                    "summary": str(row.get("Summary", "")),
+                    "classifications": clf,
+                })
+
+        profile, added = add_examples_to_profile(profile, promotable)
+        profile = profile_record_run(profile, total, agreement_val, top_themes, added)
+        st.session_state.study_profile = profile
+
+        # Run history chart
+        hist_df = run_history_df(profile)
+        if len(hist_df) > 1:
+            st.markdown("#### Agreement rate over time")
+            valid = hist_df[hist_df["agreement_rate"].notna()]
+            if not valid.empty:
+                st.line_chart(valid.set_index("date")["agreement_rate"], color="#009FD9")
+
+        if len(hist_df) >= 1:
+            st.markdown("#### Run history")
+            st.dataframe(
+                hist_df[["date", "rows_analyzed", "agreement_rate", "examples_added"]].rename(columns={
+                    "date": "Date", "rows_analyzed": "Rows", "agreement_rate": "Agreement %",
+                    "examples_added": "Examples Added",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+        dl_col1, dl_col2 = st.columns(2)
+        with dl_col1:
+            st.download_button(
+                "Download study profile (.json)",
+                export_profile(profile),
+                file_name=profile_filename(profile),
+                mime="application/json",
+                type="primary",
+            )
+        with dl_col2:
+            csv = classified.to_csv(index=False)
+            st.download_button("Download results (.csv)", csv, "results.csv", "text/csv")
+
+        # BQ stub
+        st.markdown("")
+        st.markdown(
+            '<div style="border:1px dashed #d3d4d5;border-radius:8px;padding:0.75rem 1rem;background:#FAFAFA">'
+            '<div style="font-size:0.8rem;font-weight:600;color:#676d73">Coming soon — Team Study Library</div>'
+            '<div style="font-size:0.78rem;color:#676d73;margin-top:0.25rem">'
+            'Once deployed on Data Apps, study profiles will be saved automatically to BigQuery so your '
+            'whole team can access them — no file uploads needed.'
+            '</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.divider()
+        csv = classified.to_csv(index=False)
+        st.download_button("Download results (.csv)", csv, "results.csv", "text/csv")
