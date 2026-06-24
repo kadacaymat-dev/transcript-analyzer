@@ -19,7 +19,7 @@ from pipeline.study_profile import (
     add_examples_to_profile, run_history_df,
 )
 
-st.set_page_config(page_title="Text Analyzer", layout="wide")
+st.set_page_config(page_title="AI Qualizer", layout="wide")
 
 # ── Thumbtack design system ──────────────────────────────────────
 st.markdown("""
@@ -197,8 +197,8 @@ for key, default in {
 is_setup_done = st.session_state.study_type is not None
 
 st.sidebar.markdown(
-    '<div style="font-size:1rem;font-weight:700;color:#2F3033;margin-bottom:0.25rem">Text Analyzer</div>'
-    '<div style="font-size:0.75rem;color:#676d73;margin-bottom:1rem">Thumbtack · Data & Analytics</div>',
+    '<div style="font-size:1rem;font-weight:700;color:#2F3033;margin-bottom:0.25rem">AI Qualizer</div>'
+    '<div style="font-size:0.75rem;color:#676d73;margin-bottom:1rem">Thumbtack · Quality</div>',
     unsafe_allow_html=True,
 )
 
