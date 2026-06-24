@@ -539,7 +539,8 @@ elif step == "2 · Analyze":
     display_cols = ["Date", "Summary"] + [
         dim.lower().replace(" ", "_").replace("_", " ").title() for dim in allowed
     ] + ["Confidence", "Value Check"]
-    display_cols = [c for c in display_cols if c in df.columns]
+    seen = set()
+    display_cols = [c for c in display_cols if c in df.columns and not (seen.add(c) or c in seen)]
     st.dataframe(df[display_cols], use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════
