@@ -10,8 +10,13 @@ from pipeline.golden_set import (
     record_run, add_examples, classify_with_examples,
 )
 from pipeline.sampling import required_sample_size, sample_rows
-from pipeline.bq_connector import fetch_maven_conversations, get_channel_counts, CHANNELS
+from pipeline.bq_connector import (
+    fetch_maven_conversations, get_channel_counts, CHANNELS,
+    fetch_epo_churn_transcripts, get_epo_churn_counts, get_epo_disposition_options,
+    EPO_CHURN_WINDOWS, EPO_CHURN_OUTCOMES,
+)
 from pipeline.rubric_builder import generate_rubric_from_description, rubric_from_template
+from pipeline.chat import answer_question
 from pipeline.study_profile import (
     new_profile, load_profile, export_profile, profile_filename,
     attach_rubric, rubric_from_profile,
@@ -186,9 +191,10 @@ for key, default in {
     "r_col_map": None,
     "calib_samples": None,    # list of classified sample dicts for calibration round
     "calib_reviews": {},      # {index: "up"|"down"}
-    "rubric_draft": None,      # rubric being edited before confirm
+    "rubric_draft": None,
     "selected_template": None,
-    "study_profile": None,     # active study profile dict
+    "study_profile": None,
+    "chat_history": [],        # list of {role: "user"|"assistant", content: str, rows: Optional[df]}
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -215,7 +221,7 @@ if is_setup_done:
         unsafe_allow_html=True,
     )
     if st.sidebar.button("Change setup", use_container_width=True):
-        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews", "calib_samples", "calib_reviews", "rubric_draft", "selected_template", "study_profile"]:
+        for k in ["study_type", "series_name", "golden_set", "transcripts", "rubric", "qa_sample", "qa_reviews", "calib_samples", "calib_reviews", "rubric_draft", "selected_template", "study_profile", "chat_history"]:
             st.session_state[k] = None if k not in ("qa_reviews", "series_name") else ({} if k == "qa_reviews" else "")
         st.rerun()
     st.sidebar.divider()
@@ -226,6 +232,10 @@ elif st.session_state.study_type == "Recurring":
     steps = ["1 · Upload Data", "2 · Analyze", "3 · Validate", "4 · QA Review", "5 · Golden Set", "6 · Report"]
 else:
     steps = ["1 · Upload Data", "2 · Analyze", "3 · Validate", "4 · QA Review", "5 · Report"]
+
+# Chat is available any time transcripts are loaded
+if is_setup_done and st.session_state.transcripts is not None and "Chat" not in steps:
+    steps = steps + ["Chat"]
 
 st.sidebar.markdown('<div style="font-size:0.72rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#676d73;margin-bottom:0.4rem">Steps</div>', unsafe_allow_html=True)
 step = st.sidebar.radio("Steps", steps, label_visibility="collapsed")
@@ -380,7 +390,7 @@ elif step == "1 · Upload Data":
     st.markdown("### Data source")
     data_source = st.radio(
         "Where is your data coming from?",
-        ["Upload a CSV", "Pull from BigQuery (Maven)"],
+        ["Upload a CSV", "Pull from BigQuery (Maven)", "Pull from BigQuery (EPO Churn)"],
         horizontal=True,
         key="data_source_radio",
     )
@@ -404,7 +414,7 @@ elif step == "1 · Upload Data":
                 st.session_state.t_col_map = t_map
                 st.rerun()
 
-    else:
+    elif data_source == "Pull from BigQuery (Maven)":
         # ── BigQuery: Maven SMS / Chat / Voice ──────────────────
         st.markdown("#### Maven conversation filters")
         st.caption("Pulls from `tt-dp-prod.maven.conversations` + `maven.messages`. Requires GCP access via ADC.")
@@ -458,12 +468,109 @@ elif step == "1 · Upload Data":
                 except Exception as e:
                     st.error(f"BigQuery error: {e}")
 
+    elif data_source == "Pull from BigQuery (EPO Churn)":
+        # ── BigQuery: EPO Churn — Sales & Success ───────────────
+        st.markdown("#### EPO Churn filters")
+        st.caption(
+            "Pulls pro journey transcripts from `tt-dp-prod.sandbox.jas_epo_pro_journey_20260623`, "
+            "filtered using churn labels from `jas_epo_calls_disposition_churn_20260623`. "
+            "Only includes pros with `engaged_at_call = TRUE` and `churn_28d_resolved = TRUE`. "
+            "Max 1,500 pros per Jeanne's methodology."
+        )
+
+        epo_col1, epo_col2, epo_col3 = st.columns(3)
+        churn_window = epo_col1.selectbox("Churn window", EPO_CHURN_WINDOWS, key="epo_churn_window",
+                                           help="28d = churned within 28 days; 60d = within 60 days")
+        churn_outcome = epo_col2.selectbox("Churn outcome", EPO_CHURN_OUTCOMES, key="epo_churn_outcome")
+        epo_limit = epo_col3.number_input("Max pros", min_value=10, max_value=1500, value=300, step=50, key="epo_limit")
+
+        epo_col4, epo_col5 = st.columns(2)
+        today_epo = datetime.date.today()
+        epo_start = epo_col4.date_input("Call start date (optional)", value=None, key="epo_start")
+        epo_end = epo_col5.date_input("Call end date (optional)", value=None, key="epo_end")
+
+        # Disposition multi-select — loaded on demand
+        with st.expander("Filter by call disposition (optional)"):
+            if st.button("Load disposition options", key="epo_load_disp"):
+                with st.spinner("Querying BigQuery..."):
+                    try:
+                        opts = get_epo_disposition_options()
+                        st.session_state["epo_disp_options"] = opts
+                    except Exception as e:
+                        st.error(f"BigQuery error: {e}")
+
+            disp_options = st.session_state.get("epo_disp_options", [])
+            if disp_options:
+                selected_disps = st.multiselect(
+                    "Select dispositions to include (leave empty for all)",
+                    options=disp_options,
+                    key="epo_disp_select",
+                )
+            else:
+                selected_disps = []
+                if not disp_options:
+                    st.caption("Click 'Load disposition options' above to filter by disposition.")
+
+        epo_check_col, epo_pull_col = st.columns(2)
+        if epo_check_col.button("Check counts", key="epo_check"):
+            with st.spinner("Querying BigQuery..."):
+                try:
+                    counts = get_epo_churn_counts(churn_window)
+                    if counts:
+                        count_df = pd.DataFrame([
+                            {"Outcome": outcome, "Pros": n}
+                            for outcome, n in counts.items()
+                        ])
+                        st.dataframe(count_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("No data found.")
+                except Exception as e:
+                    st.error(f"BigQuery error: {e}")
+
+        if epo_pull_col.button("Pull EPO transcripts", type="primary", key="epo_pull"):
+            with st.spinner("Pulling EPO transcripts — this may take 20-40 seconds..."):
+                try:
+                    df = fetch_epo_churn_transcripts(
+                        churn_window=churn_window,
+                        churn_outcome=churn_outcome,
+                        dispositions=selected_disps if selected_disps else None,
+                        start_date=str(epo_start) if epo_start else None,
+                        end_date=str(epo_end) if epo_end else None,
+                        limit=int(epo_limit),
+                    )
+                    if df.empty:
+                        st.warning("No transcripts returned. Try broadening the filters.")
+                    else:
+                        for col in ["Confidence", "AI Notes", "Value Check"]:
+                            df[col] = ""
+                        st.session_state.transcripts = df
+                        st.session_state.t_col_map = {"Text": "Text", "Summary": "Summary", "Date": "Date"}
+                        churned_n = (df["churned_28d"] == "true").sum() if "churned_28d" in df.columns else "?"
+                        retained_n = (df["churned_28d"] == "false").sum() if "churned_28d" in df.columns else "?"
+                        st.success(
+                            f"Pulled {len(df)} pro transcripts — "
+                            f"{churned_n} churned, {retained_n} retained (28-day window)."
+                        )
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"BigQuery error: {e}")
+
     if st.session_state.transcripts is not None:
-        src = "BigQuery" if st.session_state.get("data_source_radio") == "Pull from BigQuery (Maven)" else "file"
+        src_radio = st.session_state.get("data_source_radio", "")
+        if "EPO" in src_radio:
+            src = "BigQuery (EPO Churn)"
+        elif "Maven" in src_radio:
+            src = "BigQuery (Maven)"
+        else:
+            src = "file"
         st.success(f"{len(st.session_state.transcripts)} rows loaded from {src}.")
         with st.expander("Preview data"):
-            preview_cols = [c for c in ["Date", "channel", "Summary", "was_escalated", "sentiment", "Text"]
-                            if c in st.session_state.transcripts.columns]
+            if "EPO" in src_radio:
+                preview_cols = [c for c in ["Date", "pro_user_pk", "action_plan_status", "churned_28d", "churned_60d", "task_disposition", "Summary"]
+                                if c in st.session_state.transcripts.columns]
+            else:
+                preview_cols = [c for c in ["Date", "channel", "Summary", "was_escalated", "sentiment", "Text"]
+                                if c in st.session_state.transcripts.columns]
             st.dataframe(st.session_state.transcripts[preview_cols].head(10), use_container_width=True)
 
     st.divider()
@@ -1255,3 +1362,124 @@ elif step in ("5 · Report", "6 · Report"):
         st.divider()
         csv = classified.to_csv(index=False)
         st.download_button("Download results (.csv)", csv, "results.csv", "text/csv")
+
+# ═══════════════════════════════════════════════════════════════
+# CHAT — ask questions about the loaded transcripts
+# ═══════════════════════════════════════════════════════════════
+elif step == "Chat":
+    df = st.session_state.transcripts
+    rubric = st.session_state.rubric
+
+    n_rows = len(df)
+    has_classifications = rubric is not None and any(
+        col in df.columns
+        for col in (rubric["Dimension Name"].tolist() if "Dimension Name" in rubric.columns else [])
+    )
+
+    page_header(
+        "Chat with your data",
+        f"{n_rows} rows loaded"
+        + (" · classifications available" if has_classifications else " · not yet classified"),
+    )
+
+    st.markdown(
+        '<div style="background:#e0f3fc;border-left:3px solid #009FD9;padding:8px 12px;'
+        'border-radius:0;font-size:0.8rem;color:#185FA5;margin-bottom:1rem">'
+        'Ask anything about the transcripts. Try: <em>"How many cases mention a refund?"</em> '
+        'or <em>"Show me examples where the customer made a legal threat."</em>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Suggested questions ──────────────────────────────────────
+    suggestions = [
+        "How many transcripts mention pricing or credits?",
+        "Show me examples where the customer seems very frustrated or angry.",
+        "Find cases where the customer made a legal threat.",
+        "Which transcripts had a positive resolution?",
+        "Show me cases where the agent couldn't resolve the issue.",
+    ]
+    if has_classifications and rubric is not None:
+        dims = rubric["Dimension Name"].tolist()
+        if dims:
+            suggestions.insert(0, f"What are the most common values for '{dims[0]}'?")
+
+    with st.expander("Suggested questions", expanded=not st.session_state.chat_history):
+        sug_cols = st.columns(2)
+        for i, sug in enumerate(suggestions[:6]):
+            if sug_cols[i % 2].button(sug, key=f"sug_{i}", use_container_width=True):
+                st.session_state.chat_history.append({"role": "user", "content": sug, "rows": None})
+                st.rerun()
+
+    # ── Chat history ─────────────────────────────────────────────
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg.get("rows") is not None and not msg["rows"].empty:
+                n_match = len(msg["rows"])
+                with st.expander(f"{n_match} matching row{'s' if n_match != 1 else ''} — click to view"):
+                    preview_cols = [c for c in ["Row #", "Date", "Summary", "Text"] + (
+                        rubric["Dimension Name"].tolist() if rubric is not None and "Dimension Name" in rubric.columns else []
+                    ) if c in msg["rows"].columns]
+                    display_df = msg["rows"][preview_cols].copy()
+                    if "Text" in display_df.columns:
+                        display_df["Text"] = display_df["Text"].astype(str).str[:200] + "..."
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # ── Input ────────────────────────────────────────────────────
+    user_input = st.chat_input("Ask a question about the transcripts...")
+
+    if user_input:
+        st.session_state.chat_history.append({"role": "user", "content": user_input, "rows": None})
+
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing..."):
+                try:
+                    result = answer_question(
+                        question=user_input,
+                        df=df,
+                        history=[m for m in st.session_state.chat_history[:-1]
+                                 if m["role"] in ("user", "assistant")],
+                        rubric_df=rubric,
+                    )
+                    answer = result["answer"]
+                    matching = result["matching_rows"]
+                    capped = result["capped"]
+
+                    if capped:
+                        answer += (
+                            "\n\n*Note: The dataset has more rows than fit in a single context window. "
+                            "This answer is based on a representative sample — exact counts are estimates.*"
+                        )
+
+                    st.markdown(answer)
+
+                    if matching is not None and not matching.empty:
+                        n_match = len(matching)
+                        with st.expander(f"{n_match} matching row{'s' if n_match != 1 else ''} — click to view"):
+                            preview_cols = [c for c in ["Row #", "Date", "Summary", "Text"] + (
+                                rubric["Dimension Name"].tolist() if rubric is not None and "Dimension Name" in rubric.columns else []
+                            ) if c in matching.columns]
+                            display_df = matching[preview_cols].copy()
+                            if "Text" in display_df.columns:
+                                display_df["Text"] = display_df["Text"].astype(str).str[:200] + "..."
+                            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "rows": matching,
+                    })
+
+                except Exception as e:
+                    err = f"Error: {e}"
+                    st.error(err)
+                    st.session_state.chat_history.append({"role": "assistant", "content": err, "rows": None})
+
+        st.rerun()
+
+    # ── Clear chat ───────────────────────────────────────────────
+    if st.session_state.chat_history:
+        if st.button("Clear conversation", key="chat_clear"):
+            st.session_state.chat_history = []
+            st.rerun()

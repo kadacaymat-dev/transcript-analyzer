@@ -137,3 +137,153 @@ ORDER BY cnt DESC
 """
     rows = _run_query(sql)
     return {r["channel"]: int(r["cnt"]) for r in rows}
+
+
+# ── EPO Churn connector (Sales & Success) ──────────────────────────────────────
+
+EPO_CALLS_TABLE = "tt-dp-prod.sandbox.jas_epo_calls_disposition_churn_20260623"
+EPO_JOURNEY_TABLE = "tt-dp-prod.sandbox.jas_epo_pro_journey_20260623"
+
+EPO_CHURN_WINDOWS = ["28d", "60d"]
+EPO_CHURN_OUTCOMES = ["All pros", "Churned only", "Retained only"]
+
+
+def get_epo_disposition_options() -> list:
+    """Return distinct task_disposition values from the EPO calls table (reliable_n only)."""
+    sql = f"""
+SELECT task_disposition, COUNT(DISTINCT CAST(pro_user_pk AS STRING)) as n_pros
+FROM `{EPO_CALLS_TABLE}`
+WHERE engaged_at_call = TRUE AND churn_28d_resolved = TRUE
+  AND task_disposition IS NOT NULL
+GROUP BY task_disposition
+HAVING n_pros >= 5
+ORDER BY n_pros DESC
+"""
+    rows = _run_query(sql)
+    return [r["task_disposition"] for r in rows]
+
+
+def fetch_epo_churn_transcripts(
+    churn_window: str = "28d",
+    churn_outcome: str = "All pros",
+    dispositions: Optional[list] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 500,
+) -> pd.DataFrame:
+    """
+    Pull EPO pro journey transcripts for Sales & Success churn analysis.
+
+    Joins the per-call table (for churn labels and filters) with the per-pro journey
+    table (for journey_transcript). Applies Jeanne's clean-analysis filter:
+      engaged_at_call = TRUE AND churn_28d_resolved = TRUE
+
+    Returns DataFrame with columns: Date, Text, Summary, pro_user_pk,
+    action_plan_status, n_calls, churned_28d, churned_60d, task_disposition.
+
+    pro_user_pk is always returned as a string to prevent numeric reformatting.
+    Cap: 1,500 pros per Jeanne's methodology.
+    """
+    actual_limit = min(limit, 1500)
+
+    churn_col = "churned_within_28d" if churn_window == "28d" else "churned_within_60d"
+    resolved_col = "churn_28d_resolved"
+
+    # Build optional filter clauses
+    churn_filter = ""
+    if churn_outcome == "Churned only":
+        churn_filter = f"AND CAST({churn_col} AS STRING) = 'true'"
+    elif churn_outcome == "Retained only":
+        churn_filter = f"AND CAST({churn_col} AS STRING) = 'false'"
+
+    disposition_filter = ""
+    if dispositions:
+        quoted = ", ".join(f"'{d}'" for d in dispositions)
+        disposition_filter = f"AND task_disposition IN ({quoted})"
+
+    date_filter = ""
+    if start_date and end_date:
+        date_filter = f"AND DATE(call_date) BETWEEN '{start_date}' AND '{end_date}'"
+
+    sql = f"""
+WITH pro_sample AS (
+    SELECT
+        CAST(pro_user_pk AS STRING) AS pro_id,
+        ANY_VALUE(CAST({churn_col} AS STRING)) AS churned_28d_val,
+        ANY_VALUE(CAST(churned_within_60d AS STRING)) AS churned_60d_val,
+        STRING_AGG(DISTINCT task_disposition ORDER BY task_disposition) AS dispositions_seen,
+        ANY_VALUE(call_outcome_bucket) AS outcome_bucket
+    FROM `{EPO_CALLS_TABLE}`
+    WHERE engaged_at_call = TRUE
+      AND {resolved_col} = TRUE
+      {churn_filter}
+      {disposition_filter}
+      {date_filter}
+    GROUP BY pro_user_pk
+    LIMIT {actual_limit}
+)
+SELECT
+    ps.pro_id AS pro_user_pk,
+    j.first_call_date,
+    j.last_call_date,
+    j.action_plan_status,
+    CAST(j.n_calls AS STRING) AS n_calls,
+    ps.churned_28d_val AS churned_28d,
+    ps.churned_60d_val AS churned_60d,
+    ps.dispositions_seen AS task_disposition,
+    ps.outcome_bucket AS call_outcome_bucket,
+    j.journey_transcript
+FROM pro_sample ps
+JOIN `{EPO_JOURNEY_TABLE}` j
+    ON ps.pro_id = CAST(j.pro_user_pk AS STRING)
+WHERE j.journey_transcript IS NOT NULL
+  AND TRIM(j.journey_transcript) != ''
+ORDER BY j.first_call_date DESC
+LIMIT {actual_limit}
+"""
+
+    rows = _run_query(sql, timeout_ms=90000)
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Date", "Text", "Summary", "pro_user_pk",
+            "action_plan_status", "n_calls", "churned_28d", "churned_60d",
+            "task_disposition", "call_outcome_bucket",
+        ])
+
+    df = pd.DataFrame(rows)
+    df = df.rename(columns={
+        "first_call_date": "Date",
+        "journey_transcript": "Text",
+    })
+    # Build a human-readable Summary column from churn context
+    df["Summary"] = df.apply(
+        lambda r: (
+            f"Disposition: {r.get('task_disposition', 'unknown')} | "
+            f"Churn 28d: {r.get('churned_28d', '?')} | "
+            f"Churn 60d: {r.get('churned_60d', '?')} | "
+            f"Status: {r.get('action_plan_status', 'unknown')}"
+        ),
+        axis=1,
+    )
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    return df
+
+
+def get_epo_churn_counts(churn_window: str = "28d") -> dict:
+    """Quick count of churned vs. retained pros for the EPO churn dataset."""
+    churn_col = "churned_within_28d" if churn_window == "28d" else "churned_within_60d"
+    sql = f"""
+SELECT
+    CAST({churn_col} AS STRING) AS churned,
+    COUNT(DISTINCT CAST(pro_user_pk AS STRING)) AS n_pros
+FROM `{EPO_CALLS_TABLE}`
+WHERE engaged_at_call = TRUE AND churn_28d_resolved = TRUE
+GROUP BY churned
+ORDER BY n_pros DESC
+"""
+    rows = _run_query(sql)
+    result = {}
+    for r in rows:
+        label = {"true": "Churned", "false": "Retained"}.get(str(r["churned"]).lower(), r["churned"] or "Unknown")
+        result[label] = int(r["n_pros"])
+    return result

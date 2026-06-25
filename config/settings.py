@@ -2,9 +2,25 @@ GCP_PROJECT_ID = "tt-ai-platform"
 LOCATION = "us-central1"
 MODEL = "gemini-1.5-flash"
 
+# ── AI connection ─────────────────────────────────────────────────
+#
+# Option 1 — Vertex AI (default, works in production on Data Apps)
+#   Requires tt-ai-platform access via service account. Works automatically
+#   once deployed. Blocked locally if your account lacks aiplatform.user.
+#
+# Option 2 — Gemini API key (fallback for local development)
+#   Get a free key at: https://aistudio.google.com/app/apikey
+#   Paste it below. The app tries Vertex AI first; if it gets a 403 it
+#   automatically falls back to the API key.
+#
+GEMINI_API_KEY = ""   # ← paste your key here for local dev; leave empty in production
+
 VERTEX_URL = (
     f"https://{LOCATION}-aiplatform.googleapis.com/v1/projects/{GCP_PROJECT_ID}"
     f"/locations/{LOCATION}/publishers/google/models/{MODEL}:generateContent"
+)
+GEMINI_API_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 )
 
 CLASSIFICATION_COLUMNS = [
@@ -143,6 +159,34 @@ RUBRIC_TEMPLATES = {
                 "name": "Outcome",
                 "values": ["resolved", "referred to help center", "escalated", "not applicable"],
                 "description": "How the feature-related discussion was handled.",
+            },
+        ],
+    },
+    "EPO Churn Analysis": {
+        "label": "EPO Churn Analysis",
+        "description": "Analyze Early Pro Onboarding transcripts to understand why pros churn within 28 or 60 days of their first Sales & Success call.",
+        "mode": "Transcript Analysis",
+        "example_prompt": "Understand why newly onboarded pros churn within 28 days of their EPO call",
+        "dimensions": [
+            {
+                "name": "Churn Signal",
+                "values": ["explicit intent to leave", "dissatisfaction expressed", "disengaged / unresponsive", "positive / interested", "neutral", "unclear"],
+                "description": "Whether the transcript contains language or behavior that predicts churn.",
+            },
+            {
+                "name": "Primary Concern",
+                "values": ["lead quality / quantity", "pricing / credits", "not enough work", "platform confusion", "competition / alternatives", "no concern raised", "other"],
+                "description": "The main concern or objection the pro raised during the EPO interaction.",
+            },
+            {
+                "name": "Rep Action",
+                "values": ["addressed concern effectively", "offered support / resources", "scheduled follow-up", "closed / converted", "no meaningful action", "could not reach pro"],
+                "description": "What the Sales & Success rep did to address the pro's situation.",
+            },
+            {
+                "name": "Pro Engagement",
+                "values": ["high — full conversation", "medium — partial engagement", "low — brief / distracted", "no contact"],
+                "description": "How engaged the pro was during the EPO interaction.",
             },
         ],
     },
